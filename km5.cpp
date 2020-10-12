@@ -35,6 +35,7 @@ UINT		preconfig=0;
 UINT		res=0;							// SQL request result
 WCHAR		bufMB[2501];
 UINT		chan_num[MAX_KM_NUM]={0};	// 
+UINT		sqlerror=0;
 //---------------------------------------------------------------------------------
 UINT	Com_number=0;				// порты и ипшники, которые найдены в конфиге
 UINT	KMNum=0;					// device numbers
@@ -192,6 +193,8 @@ UL_INFO((LOGID, "CoRegisterClassObject() Ok...."));	// write to log
 
 Sleep(1000);
 my_CF.Release();		// avoid locking by CoRegisterClassObject() 
+my_CF.Release();		// avoid locking by CoRegisterClassObject() 
+//UL_INFO((LOGID, "my_CF.in_use(%d)",my_CF.in_use()));	// write to log
 if (OPCstatus!=OPC_STATUS_RUNNING)	// ???? maybe Status changed and OPC not currently running??
 	{	while(my_CF.in_use()) Sleep(1000);	// wait
 		cleanup_all(objid);
@@ -229,7 +232,7 @@ UINT InitDriver()
  LONG ecode;		// error code 
  CHAR	name[100];	// device name
  tTotal = TAGS_NUM_MAX;		// total tag quantity
- UL_ERROR((LOGID, "Attempt connect to database on host [%s] with login: %s | pass: %s",host,login,pass)); printf ("Attempt connect to database on host [%s] with login: %s | pass: %s\n",host,login,pass);
+ UL_ERROR((LOGID, "Attempt connect to database on host [%s] with login: [%s] | pass: [%s]",host,login,pass)); printf ("Attempt connect to database on host [%s] with login: %s | pass: %s\n",host,login,pass);
  dbase.dblogon();
  if (!dbase.sqlconn((UCHAR FAR *) host,(UCHAR FAR *) login,(UCHAR FAR *) pass))
 	{
@@ -253,6 +256,7 @@ UINT InitDriver()
  UL_TRACE((LOGID, "%!e loServiceCreate()=", ecode));	// write to log returning code
  if (ecode) return 1;									// error to create service	
  InitializeCriticalSection(&lk_values);
+ EnterCriticalSection(&lk_values);
  // COM ports ------------------------------------------------------------------------------------------------
  COMMTIMEOUTS timeouts;
  timeouts.ReadIntervalTimeout = 3;
@@ -293,13 +297,29 @@ UINT InitDriver()
 		 j++;
 		}
 	}
- 
+ LeaveCriticalSection(&lk_values);
  UL_INFO((LOGID, "Total %d devices found",KMNum)); 
  if (!KMNum) { UL_ERROR((LOGID, "No devices found")); return 1; } 
 
  if (init_tags())	return 1; 
  else				return 0;
 }
+//-------------------------------------------------------------------
+UINT DestroyDriver()
+{
+  if (my_service)		
+    {
+      INT ecode = loServiceDestroy(my_service);
+      UL_INFO((LOGID, "%!e loServiceDestroy(%p) = ", ecode));	// destroy derver
+      DeleteCriticalSection(&lk_values);						// destroy CS
+      my_service = 0;		
+    }
+ for (UINT i=0; i<Com_number; i++) port[i].Close();
+ UL_INFO((LOGID, "Close COM-port"));						// write in log
+ return	1;
+}
+
+
 //-----------------------------------------------------------------------------------
 VOID poll_device()
 {
@@ -311,9 +331,11 @@ VOID poll_device()
     {
 	 UL_DEBUG((LOGID, "[%d/%d] (%d) type=%d",d,r,km[d].tags[r],TagR[km[d].tags[r]].type));
      if (TagR[km[d].tags[r]].type==0) km[d].ReadDataCurrent (km[d].tags[r],r);
-     if (TagR[km[d].tags[r]].type==1) km[d].ReadAllArchive (km[d].tags[r],r,1);
-	 if (TagR[km[d].tags[r]].type==2) km[d].ReadAllArchive (km[d].tags[r],r,1);
+     if (TagR[km[d].tags[r]].type==1) km[d].ReadAllArchive (km[d].tags[r],r,12);
+	 if (TagR[km[d].tags[r]].type==2) km[d].ReadAllArchive (km[d].tags[r],r,7);
+	 //Sleep (10000);
 	}
+ UL_DEBUG((LOGID, "Polling complete (%d seconds) [%d|%d]",GetTickCount()-start,KMNum,tag_num));
  ecode=Com_number;
  Sleep (200);
  GetSystemTimeAsFileTime(&ft);
@@ -347,8 +369,9 @@ VOID poll_device()
 		 if (wcslen (bufMB)>1000) UL_DEBUG((LOGID, "string lenght %d",wcslen (bufMB)));
 		}
 	 V_VT(&tv[ci].tvValue) = tvVt;
-	 if (TagR[ci].status) tv[ci].tvState.tsQuality = OPC_QUALITY_GOOD;
+	 if (!TagR[ci].status) tv[ci].tvState.tsQuality = OPC_QUALITY_GOOD;
 	 else tv[ci].tvState.tsQuality = OPC_QUALITY_UNCERTAIN;
+	 tv[ci].tvState.tsQuality = OPC_QUALITY_GOOD;
 	 tv[ci].tvState.tsTime = ft;
 	}
  loCacheUpdate(my_service, tag_num, tv, 0);
@@ -380,13 +403,19 @@ int DeviceKM5::ReadDataCurrent (UINT tags_num, UINT  sens_num)
 	 else
 		{
 		 if (this->prm[sens_num]==4) 
-			if (fl>10 && fl<100) StoreData (this->device, this->prm[sens_num], this->pipe[sens_num], 0, fl);
+			{
+			 if (fl>10 && fl<100) StoreData (1000+TagR[tags_num].pipe*10+TagR[tags_num].prm, this->prm[sens_num], this->pipe[sens_num], 0, fl);
+			 else TagR[tag_num].status=1;
+			}
 	     else 
 			{
-			 if (this->prm[sens_num]>20) StoreData (this->device, this->prm[sens_num]-10, this->pipe[sens_num], 0, fl);
-			 else StoreData (this->device, this->prm[sens_num], this->pipe[sens_num], 0, fl);
+			 if (fl>0)
+			 if (this->prm[sens_num]>20)StoreData (1000+TagR[tags_num].pipe*10+TagR[tags_num].prm, this->prm[sens_num]-10, this->pipe[sens_num], 0, fl);
+			 else StoreData (1000+TagR[tags_num].pipe*10+TagR[tags_num].prm, this->prm[sens_num], this->pipe[sens_num], 0, fl);
+			 TagR[tags_num].status=0;
 			}
-		 UL_DEBUG((LOGID,"[km][%d][%d] [%d][%d] [0x%x 0x%x 0x%x 0x%x] [%f]",this->device,this->prm[sens_num],sens_num,this->cur[sens_num],data[this->cur[sens_num]+3],data[this->cur[sens_num]+4],data[this->cur[sens_num]+5],data[this->cur[sens_num]+6],fl));
+		 UL_DEBUG((LOGID,"[km] [%d][%d] [%d][%d] [0x%x 0x%x 0x%x 0x%x] [%f]",1000+TagR[tags_num].pipe*10+TagR[tags_num].prm,this->prm[sens_num],sens_num,this->cur[sens_num],data[this->cur[sens_num]+3],data[this->cur[sens_num]+4],data[this->cur[sens_num]+5],data[this->cur[sens_num]+6],fl));
+		 printf ("[km] [%d][%d] [%d][%d] [0x%x 0x%x 0x%x 0x%x] [%f]\n",1000+TagR[tags_num].pipe*10+TagR[tags_num].prm,this->prm[sens_num],sens_num,this->cur[sens_num],data[this->cur[sens_num]+3],data[this->cur[sens_num]+4],data[this->cur[sens_num]+5],data[this->cur[sens_num]+6],fl);
 		}
 	 sprintf (TagR[tags_num].value,"%f",fl);
 	} 
@@ -432,15 +461,19 @@ int DeviceKM5::ReadAllArchive (UINT tags_num, UINT  sens_num, UINT tp)
 	  if (rs)  value=*(float*)(data+4+this->cur[sens_num]);
 	  sprintf (TagR[tags_num].value,"(%s) %f",date,value);
 
-      if (rs)  UL_DEBUG((LOGID,"[km] [1] [%d] [%d] [%d] [%x %x %x %x][%f]",index,sens_num,this->cur[sens_num],data[4+this->cur[sens_num]],data[5+this->cur[sens_num]],data[6+this->cur[sens_num]],data[7+this->cur[sens_num]],value));
+      if (rs)  
+			{
+			 UL_DEBUG((LOGID,"[km] [%d][%d] [%d] [%d] [%x %x %x %x][%f]",1000+TagR[tags_num].pipe*10+TagR[tags_num].prm,index,sens_num,this->cur[sens_num],data[4+this->cur[sens_num]],data[5+this->cur[sens_num]],data[6+this->cur[sens_num]],data[7+this->cur[sens_num]],value));
+			 printf ("[km] [%d] [%d] [%d] [%d] [%x %x %x %x][%f]\n",1000+TagR[tags_num].pipe*10+TagR[tags_num].prm,index,sens_num,this->cur[sens_num],data[4+this->cur[sens_num]],data[5+this->cur[sens_num]],data[6+this->cur[sens_num]],data[7+this->cur[sens_num]],value);
+			}
       if (rs)  if (value<10000000 && value>0) 
 
 	  if ((((data[8]&0xf0)>>4)*10+(data[8]&0xf))>8)
 	    {	     
-	     if (value>0) StoreData (this->device, this->prm[sens_num], this->pipe[sens_num], TagR[tags_num].type, 0, value, date);
-	     if (this->prm[sens_num]==23) if (value>0) StoreDataC (this->device, 23, 13, TagR[tags_num].type, 0, value, date);
-	     if (this->prm[sens_num]==22) if (value>0) StoreDataC (this->device, 22, 12, TagR[tags_num].type, 0, value, date);
-	     if (this->prm[sens_num]==21) if (value>0) StoreDataC (this->device, 21, 11, TagR[tags_num].type, 0, value, date);
+		 TagR[tags_num].status=0;
+	     if (value>0) StoreData (1000+TagR[tags_num].pipe*10+TagR[tags_num].prm, this->prm[sens_num], this->pipe[sens_num], TagR[tags_num].type, 0, value, date);
+	     if (this->prm[sens_num]==23) if (value>0) StoreDataC (1000+TagR[tags_num].pipe*10+TagR[tags_num].prm, 23, 1000+TagR[tags_num].pipe*10+TagR[tags_num].prm+5, TagR[tags_num].type, 0, value, date);
+	     if (this->prm[sens_num]==22) if (value>0) StoreDataC (1000+TagR[tags_num].pipe*10+TagR[tags_num].prm, 22, 1000+TagR[tags_num].pipe*10+TagR[tags_num].prm+5, TagR[tags_num].type, 0, value, date);
 	    }	  
 	  if (index==0) break;
 	  index--; vsk--;
@@ -451,30 +484,69 @@ int DeviceKM5::ReadAllArchive (UINT tags_num, UINT  sens_num, UINT tp)
 //---------------------------------------------------------------------------------------------------
 BOOL StoreData (UINT dv, UINT prm, UINT pipe, UINT status, FLOAT value)
 {
- sprintf (query,"SELECT * FROM prdata WHERE type=0 AND prm=%d AND device=%d AND pipe=%d",prm,dv,pipe);
+ sprintf (query,"SELECT * FROM currentsdata WHERE ID_Channel=%d",dv);
  //printf ("%s\n",query); UL_INFO((LOGID, "!!!!!!!!!!!!!!!!!!!!! (%s)",query));
  res=dbase.sqlexec((UCHAR FAR *)query,dataset);
- if (res>1) sprintf (query,"UPDATE prdata SET value=%f,status=%d WHERE type=0 AND prm=%d AND device=%d AND pipe=%d",value,status,prm,dv,pipe);
+ if (res>1) sprintf (query,"UPDATE currentsdata SET Value=%f,MeasureDate=NOW() WHERE ID_Channel=%d",value,dv);
  else 
     {
-     sprintf (query,"INSERT INTO prdata(device,prm,type,value,status,pipe) VALUES('%d','%d','0','%f','%d','%d')",dv,prm,value,status,pipe);
+     sprintf (query,"INSERT INTO currentsdata(ID_Channel,MeasureDate,Value) VALUES('%d',NOW(),'%f')",dv,value);
     }
  res=dbase.sqlexec((UCHAR FAR *)query,dataset);  
+ UL_INFO((LOGID, "SQLDirect (%s) retcode = %d",query,res));
  return true;
 }
 //---------------------------------------------------------------------------------------------------
 BOOL StoreData (UINT dv, UINT prm, UINT pipe, UINT type, UINT status, FLOAT value, CHAR* data)
 {
- sprintf (query,"SELECT * FROM prdata WHERE device=%d AND type=%d AND prm=%d AND pipe=%d AND date=%s",dv,type,prm,pipe,data);
- res=dbase.sqlexec((UCHAR FAR *)query, dataset);
- if (res>1)
-    {
-     sprintf (query,"UPDATE prdata SET value=%f,status=%d,date=date WHERE pipe='%d' AND type='%d' AND prm=%d AND date='%s' AND device=%d",value,status,pipe,type,prm,data,dv);
-	 res=dbase.sqlexec((UCHAR FAR *)query, dataset);
-     return true;     
-    }
- else sprintf (query,"INSERT INTO prdata(device,prm,type,value,status,date,pipe) VALUES('%d','%d','%d','%f','%d','%s','%d')",dv,prm,type,value,status,data,pipe);
- res=dbase.sqlexec((UCHAR FAR *)query, dataset);
+ //SQLRETURN  retcode;
+ SQLCloseCursor(dbase.hstmt);
+ if (type==1) sprintf (query,"SELECT * FROM mains WHERE ID_Channel=%d AND MeasureDate=%s",dv,data);
+ if (type==2) sprintf (query,"SELECT * FROM daydata WHERE ID_Channel=%d AND MeasureDate=%s",dv,data);
+ SQLRETURN retcode=SQLExecDirect (dbase.hstmt, (UCHAR *)query, SQL_NTS);
+ UL_INFO((LOGID, "SQLDirect (%s) retcode = %d",query,retcode));
+ if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO) 
+	{
+	 retcode = SQLFetch(dbase.hstmt);
+	 if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO)
+	    {
+		 if (type==1) sprintf (query,"UPDATE mains SET Value='%f',State='%d',MeasureDate=MeasureDate WHERE MeasureDate='%s' AND ID_Channel=%d",value,status,data,dv);
+		 if (type==2) sprintf (query,"UPDATE daydata SET Value='%f',State='%d',MeasureDate=MeasureDate WHERE MeasureDate='%s' AND ID_Channel=%d",value,status,data,dv);
+		 SQLCloseCursor(dbase.hstmt);
+		 retcode=SQLExecDirect (dbase.hstmt, (UCHAR *)query, SQL_NTS);
+		 UL_INFO((LOGID, "SQLDirect (%s) retcode = %d",query,res));
+		 return true;     
+		}
+	else 
+		{
+		 if (type==1) sprintf (query,"INSERT INTO mains(ID_Channel,MeasureDate,Value,State) VALUES('%d','%s','%f','%d')",dv,data,value,status);
+		 if (type==2) sprintf (query,"INSERT INTO daydata(ID_Channel,MeasureDate,Value,State) VALUES('%d','%s','%f','%d')",dv,data,value,status);
+		}
+	}
+ //res=dbase.sqlexec((UCHAR FAR *)query, dataset);
+ SQLCloseCursor(dbase.hstmt);
+ retcode=SQLExecDirect (dbase.hstmt, (UCHAR *)query, SQL_NTS);
+ if (retcode==-1)
+		{
+		 sqlerror++;
+		 if (sqlerror>3)
+			 {
+ 				dbase.sqldisconn();			 
+				CHAR host[100],login[100],pass[100];
+				strcpy (host,ReadParam ("database","host"));
+				strcpy (login,ReadParam ("database","login"));
+				strcpy (pass,ReadParam ("database","pass"));
+				while (1)
+					{
+					 if (!dbase.sqlconn((UCHAR FAR *) host,(UCHAR FAR *) login,(UCHAR FAR *) pass))
+						UL_ERROR((LOGID, "Cannot connect to host!"));
+					 else { UL_ERROR((LOGID, "Connect to host success")); break; }
+					}
+			}
+		}
+ else sqlerror=0;
+ UL_INFO((LOGID, "SQLDirect (%s) retcode = %d",query,res));
+ SQLCloseCursor(dbase.hstmt);
  return true;
 }
 //---------------------------------------------------------------------------------------------------
@@ -488,37 +560,43 @@ BOOL StoreDataC (UINT dv, UINT prm, UINT prm2, UINT type, UINT status, FLOAT val
  GetLocalTime (&curr);
  if (type==1) sprintf (dat,"%04d%02d%02d%02d0000",curr.wYear,curr.wMonth,curr.wDay,curr.wMinute);
  if (type==2) sprintf (dat,"%04d%02d%02d000000",curr.wYear,curr.wMonth,curr.wDay);
- //float pw,pw2;
  time_t tim;
- //double	dt;
- //struct tm tt;
  struct tm ct;
-
- sprintf (query,"SELECT * FROM prdata WHERE type=%d AND prm=%d AND device=%d AND date=%s AND pipe=0 ORDER BY date DESC",type,prm,dv,date);
- SQLRETURN  retcode=SQLExecDirect (dbase.hstmnt, (UCHAR *)query, SQL_NTS);
+ SQLCloseCursor(dbase.hstmt);
+ if (type==1) sprintf (query,"SELECT * FROM mains WHERE ID_Channel=%d AND MeasureDate<%s ORDER BY MeasureDate DESC",dv,date);
+ if (type==2) sprintf (query,"SELECT * FROM daydata WHERE ID_Channel=%d AND MeasureDate<%s ORDER BY MeasureDate DESC",dv,date);
+ SQLRETURN  retcode=SQLExecDirect (dbase.hstmt, (UCHAR *)query, SQL_NTS);
  UL_INFO((LOGID, "SQLDirect (%s) retcode = %d",query,retcode));
  if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO) 
 		{
-		 retcode = SQLFetch(dbase.hstmnt);
+		 retcode = SQLFetch(dbase.hstmt);
 		 if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO)
 			{
-			 SQLGetData(dbase.hstmnt, 5, SQL_C_TYPE_TIMESTAMP, &btime, sizeof (btime), NULL);
-			 SQLGetData(dbase.hstmnt, 6, SQL_C_DOUBLE, &flt, sizeof (flt), NULL);
+			 SQLGetData(dbase.hstmt, 2, SQL_C_TYPE_TIMESTAMP, &btime, sizeof (btime), NULL);
+			 SQLGetData(dbase.hstmt, 3, SQL_C_DOUBLE, &flt, sizeof (flt), NULL);
 			 dat[0]=0;
 			 if (type==1) sprintf (dat,"%04d%02d%02d%02d0000",btime.year,btime.month,btime.day,btime.hour);
 			 if (type==2) sprintf (dat,"%04d%02d%02d000000",btime.year,btime.month,btime.day);
 			 UL_INFO((LOGID, "[km] row=%s %04d%02d%02d%02d0000 [%f-%f]",dat,btime.year,btime.month,btime.day,btime.hour,value,flt));
-		     SQLCloseCursor(dbase.hstmnt);
+		     SQLCloseCursor(dbase.hstmt);
 			 DOUBLE	dt=value-flt;
-			 sprintf (query,"SELECT * FROM prdata WHERE type=%d AND prm=%d AND device=%d AND date=%s",type,prm2,dv,dat);
+			 if (type==1) sprintf (query,"SELECT * FROM mains WHERE ID_Channel=%d AND MeasureDate=%s",prm2,date);
+			 if (type==2) sprintf (query,"SELECT * FROM daydata WHERE ID_Channel=%d AND MeasureDate=%s",prm2,date);
 			 retcode=SQLExecDirect (dbase.hstmt, (UCHAR *)query, SQL_NTS);
 			 UL_INFO((LOGID, "SQLDirect (%s) retcode = %d",query,retcode));
 			 if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO) 
 			 if (dt>0 && dt<10000 && btime.year>2009 && btime.year<2100)
 				{
 				 retcode = SQLFetch(dbase.hstmt);
-				 if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO) return true;
-			     else sprintf (query,"INSERT INTO prdata(device,prm,value,status,date,type) VALUES('%d','%d','%f','%d','%s','%d')",dv,prm2,dt,status,dat,type);
+				 if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO) 
+					{
+					 if (type==2) sprintf (query,"UPDATE daydata SET Value='%f',State='%d',MeasureDate=MeasureDate WHERE MeasureDate='%s' AND ID_Channel=%d",dt,status,date,prm2);
+					}
+			     else 
+					{
+					 if (type==1) sprintf (query,"INSERT INTO mains(ID_Channel,MeasureDate,Value,State) VALUES('%d','%s','%f','%d')",prm2,date,dt,status);
+					 if (type==2) sprintf (query,"INSERT INTO daydata(ID_Channel,MeasureDate,Value,State) VALUES('%d','%s','%f','%d')",prm2,date,dt,status);
+					}
 				 retcode=SQLExecDirect (dbase.hstmt, (UCHAR *)query, SQL_NTS);
 				 UL_INFO((LOGID, "SQLDirect (%s) retcode = %d",query,retcode));
 				}
@@ -664,20 +742,6 @@ VOID WriteToPort (UINT com, UINT device, CHAR* Out)
 	}
  //if (dwbr1>0 && dwbr1<100) for (UINT i=0;i<dwbr1;i++) UL_INFO((LOGID,"[%d]  [%d] = 0x%x [%c]",device,i,(UCHAR)sBuf1[i],(UCHAR)sBuf1[i]));
 }
-//-------------------------------------------------------------------
-UINT DestroyDriver()
-{
-  if (my_service)		
-    {
-      INT ecode = loServiceDestroy(my_service);
-      UL_INFO((LOGID, "%!e loServiceDestroy(%p) = ", ecode));	// destroy derver
-      DeleteCriticalSection(&lk_values);						// destroy CS
-      my_service = 0;		
-    }
- for (UINT i=0; i<Com_number; i++) port[i].Close();
- UL_INFO((LOGID, "Close COM-port"));						// write in log
- return	1;
-}
 //-----------------------------------------------------------------------------        
 BYTE CRC(const BYTE* const Data, const BYTE DataSize, BYTE type)
     {
@@ -724,7 +788,7 @@ CHAR* ReadParam (CHAR *SectionName,CHAR *Value)
 						if (s_ok>=strlen(string2)) buf[s_ok-strlen(Value)-1]=buf[s_ok];
 							 buf[s_ok-strlen(string2)]='\0';					
 					 strcpy(ret,buf);
-					 UL_INFO((LOGID, "ret = %s",ret));
+					 printf ("found: ret = %s\n",ret);
 					 return bret;
 					}
 				}
@@ -781,8 +845,10 @@ INT init_tags(VOID)
 		 UL_TRACE((LOGID, "%!e loAddRealTag(%s) = %u (t=%d)", ecode, tn[i], ti[i], TagR[i].type));
 		 printf ("loAddRealTag(%s) = %u (t=%d)\n", tn[i], ti[i], TagR[i].type);
 		 TagR[i].name = new char[DATALEN_MAX];
+		 
 		 sprintf (TagR[i].name,"%s",tn[i]);
 		 TagR[i].pipe=Tag[r].pipe; 
+		 TagR[i].prm=Tag[r].prm; 
 		 km[kkm].pipe[r]=Tag[r].pipe; km[kkm].addr[r]=Tag[r].adr; km[kkm].cur[r]=Tag[r].del; km[kkm].prm[r]=Tag[r].prm; km[kkm].tags[r]=i;
 		 i++; tag_num++; km[kkm].channels++;
 		}
@@ -805,47 +871,3 @@ CHAR *absPath(CHAR *fileName)					// return abs path of file
   cp=strncpy(cp,fileName,255);
   return path;}
 //----------------------------------------------------------------------------------
-/*
-CHAR* ReadParam (CHAR *SectionName,CHAR *Value)
-{
- CHAR buf[150], string1[50], string2[50]; CHAR ret[150]={0};
- CHAR *pbuf=buf; CHAR *bret=ret;
- UINT s_ok=0;
- sprintf(string1,"[%s]",SectionName);
- sprintf(string2,"%s=",Value);
- rewind (CfgFile);
- while(!feof(CfgFile))
- if(fgets(buf,50,CfgFile)!=NULL)
-	if (strstr(buf,string1))
-		{ s_ok=1; break; }
- if (s_ok)
-	{
-	 while(!feof(CfgFile))
-		{
-		 if(fgets(buf,100,CfgFile)!=NULL)
-			{
-			 if (strstr(buf,"[")==NULL && strstr(buf,"]")==NULL)
-				{
-				 for (s_ok=0;s_ok<strlen(buf)-1;s_ok++) if (buf[s_ok]==';') buf[s_ok+1]='\0';				 
-				 if (strstr(buf,string2))
-					{
-					 for (s_ok=0;s_ok<strlen(buf)-1;s_ok++)
-						if (s_ok>=strlen(string2)) buf[s_ok-strlen(Value)-1]=buf[s_ok];
-							 buf[s_ok-strlen(string2)]='\0';					
-					 strcpy(ret,buf);
-					 return bret;
-					}
-				}
-			  else { buf[0]=0; buf[1]=0; strcpy(ret,buf); return bret; }
-			 }
-		}	 	
- 	 if (SectionName=="Port")	{ buf[0]='1'; buf[1]=0;}
-	 buf[0]=0; buf[1]=0;
-	 strcpy(ret,buf); return bret;
-	}
- else{
-	 sprintf(buf, "error");			// if something go wrong return error
-	 strcpy(ret,buf); return bret;
-	}	
-}
-*/
